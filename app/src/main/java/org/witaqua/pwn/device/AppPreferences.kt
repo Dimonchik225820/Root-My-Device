@@ -2,7 +2,9 @@ package org.witaqua.pwn.device
 
 import android.app.LocaleManager
 import android.content.Context
+import android.os.Build
 import android.os.LocaleList
+import androidx.annotation.RequiresApi
 
 enum class AccentColor(val storedValue: String) {
     Dynamic("dynamic"),
@@ -125,11 +127,22 @@ object AppPreferences {
             .commit()
     }
 
+    /**
+     * Returns the per-app locale tag set via [setLanguage], or an empty string
+     * when running below API 33 (where [LocaleManager] does not exist) or when
+     * no per-app locale has been selected.
+     */
     fun languageTag(context: Context): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return ""
         val locales = context.getSystemService(LocaleManager::class.java).applicationLocales
         return if (locales.isEmpty) "" else locales[0].toLanguageTag()
     }
 
+    /**
+     * Sets the per-app locale. No-op below API 33, where [LocaleManager] is
+     * unavailable; the language row in Settings is hidden on those versions.
+     */
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     fun setLanguage(context: Context, languageTag: String) {
         context.getSystemService(LocaleManager::class.java).applicationLocales =
             LocaleList.forLanguageTags(languageTag)
