@@ -13,7 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "org.witaqua.pwn.device"
-        minSdk = 33
+        minSdk = 31
         targetSdk = 36
         versionCode = 14
         versionName = "0.0.7"
