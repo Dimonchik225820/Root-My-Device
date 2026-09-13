@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -12,6 +14,63 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+/* Android 12 seccomp kills the thread with SIGSYS instead of returning EPERM
+ * for disallowed syscalls (behaviour changed in Android 13). Catch SIGSYS so
+ * perf_event_open and bpf probes report "denied" rather than crashing. */
+static volatile sig_atomic_t g_sigsys_caught;
+static sigjmp_buf             g_sigsys_jmp;
+
+static void sigsys_handler(int sig, siginfo_t *info, void *ctx) {
+  (void)sig; (void)info; (void)ctx;
+  g_sigsys_caught = 1;
+  siglongjmp(g_sigsys_jmp, 1);
+}
+
+/* Returns fd on success, -1 with errno set on failure/blocked. */
+static int safe_perf_event_open(struct perf_event_attr *attr,
+                                pid_t pid, int cpu, int group_fd,
+                                unsigned long flags) {
+  struct sigaction sa_new, sa_old;
+  memset(&sa_new, 0, sizeof(sa_new));
+  sa_new.sa_sigaction = sigsys_handler;
+  sa_new.sa_flags     = SA_SIGINFO | SA_RESETHAND;
+  sigemptyset(&sa_new.sa_mask);
+
+  g_sigsys_caught = 0;
+  sigaction(SIGSYS, &sa_new, &sa_old);
+
+  int fd = -1;
+  if (sigsetjmp(g_sigsys_jmp, 1) == 0) {
+    fd = (int)syscall(SYS_perf_event_open, attr, pid, cpu, group_fd, flags);
+  } else {
+    errno = EPERM;
+  }
+
+  sigaction(SIGSYS, &sa_old, NULL);
+  return fd;
+}
+
+static int safe_bpf(int cmd, union bpf_attr *attr, unsigned int size) {
+  struct sigaction sa_new, sa_old;
+  memset(&sa_new, 0, sizeof(sa_new));
+  sa_new.sa_sigaction = sigsys_handler;
+  sa_new.sa_flags     = SA_SIGINFO | SA_RESETHAND;
+  sigemptyset(&sa_new.sa_mask);
+
+  g_sigsys_caught = 0;
+  sigaction(SIGSYS, &sa_new, &sa_old);
+
+  int fd = -1;
+  if (sigsetjmp(g_sigsys_jmp, 1) == 0) {
+    fd = (int)syscall(SYS_bpf, cmd, attr, size);
+  } else {
+    errno = EPERM;
+  }
+
+  sigaction(SIGSYS, &sa_old, NULL);
+  return fd;
+}
 
 static void append_probe(char *output, size_t output_size, const char *name,
                          const char *path, int flags) {
@@ -165,7 +224,7 @@ Java_org_witaqua_pwn_device_NativeProbe_run(JNIEnv *env, jobject thiz) {
   perf_attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN;
   perf_attr.disabled = 1;
   errno = 0;
-  int perf_fd = (int)syscall(SYS_perf_event_open, &perf_attr, 0, -1, -1, 0);
+  int perf_fd = safe_perf_event_open(&perf_attr, 0, -1, -1, 0);
   int perf_errno = errno;
   if (perf_fd >= 0) {
     close(perf_fd);
@@ -184,8 +243,7 @@ Java_org_witaqua_pwn_device_NativeProbe_run(JNIEnv *env, jobject thiz) {
   bpf_attr.value_size = sizeof(uint64_t);
   bpf_attr.max_entries = 1;
   errno = 0;
-  int bpf_fd = (int)syscall(SYS_bpf, BPF_MAP_CREATE, &bpf_attr,
-                            sizeof(bpf_attr));
+  int bpf_fd = safe_bpf(BPF_MAP_CREATE, &bpf_attr, sizeof(bpf_attr));
   int bpf_errno = errno;
   if (bpf_fd >= 0) {
     close(bpf_fd);
